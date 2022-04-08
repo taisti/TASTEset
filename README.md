@@ -14,6 +14,12 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
+To freely import all scripts, please add the followings to the PYTHONPATH:
+```bash
+export PYTHONPATH=$PYTHONPATH:<path-to-tasteset-repo>/src
+```
+
+
 If any problems with requirements occur, you should be fine if you install 
 any version of pandas, spacy, nervaluate, scikit-learn. With `transformers` 
 or `flair` some issues might occur, hence, Docker is preferable in the future!
