@@ -25,13 +25,14 @@ def main():
         #results, results_by_tag = evaluate_predictions(...)
 
     print("SAMPLE SPANS EVALUATION")
+    print(entities[:10])
     results, results_by_tag = \
         evaluate_predictions(entities[:10], entities[:10], "spans")
     print(results)
     print(results_by_tag)
 
-    print(bio_entities[:10])
     print("SAMPLE BIO EVALUATION")
+    print(bio_entities[:10])
     results, results_by_tag = \
         evaluate_predictions(bio_entities[:10], bio_entities[:10], "bio")
     print(results)
