@@ -7,8 +7,8 @@ from nervaluate import Evaluator
 
 
 NLP = spacy.load('en_core_web_sm')
-ENTITIES = ["FOOD", "QUANTITY", "UNIT", "PROCESS",
-            "PHYSICAL_QUALITY", "COLOR", "PURPOSE", "PART"]
+ENTITIES = ["FOOD", "QUANTITY", "UNIT", "PROCESS", "PHYSICAL_QUALITY", "COLOR",
+            "TASTE", "PURPOSE", "PART"]
 
 
 def prepare_data(taste_set, entities_format="spans"):
