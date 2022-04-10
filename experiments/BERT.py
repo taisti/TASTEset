@@ -164,7 +164,8 @@ class TastyModel:
             model_name_or_path,
             num_labels=len(self.config["label2id"]),
             ignore_mismatched_sizes=True,
-            label2id=label2id, id2label=id2label
+            label2id=label2id, id2label=id2label,
+            classifier_dropout=0.2
         )
 
         training_args = TrainingArguments(
@@ -272,7 +273,7 @@ def cross_validate(args):
         ENTITIES + ["all"]
     }
 
-    print(f"{'entity':^20s}{'precision':^14s}{'recall':^14s}{'f1-score':^14s}")
+    print(f"{'entity':^20s}{'precision':^15s}{'recall':^15s}{'f1-score':^15s}")
     for entity in cross_val_results_aggregated.keys():
         print(f"{entity:^20s}", end="")
         for metric in cross_val_results_aggregated[entity].keys():
@@ -283,10 +284,10 @@ def cross_validate(args):
 
             mean = np.mean(cross_val_results_aggregated[entity][metric])
             mean = int(mean * 1000) / 1000
-            std = np.mean(cross_val_results_aggregated[entity][metric])
+            std = np.std(cross_val_results_aggregated[entity][metric])
             std = int(std * 1000) / 1000 + 0.001 * \
                   round(std - int(std * 1000) / 1000)
-            print(f"{mean:^2.3f} +- {std:^2.3f}", end="")
+            print(f"{mean:^2.3f} +- {std:^2.3f} ", end="")
         print()
 
     
