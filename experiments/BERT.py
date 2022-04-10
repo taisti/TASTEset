@@ -2,9 +2,10 @@ import argparse
 import re
 import json
 import numpy as np
-from transformers import (BertForTokenClassification, BertTokenizer, Trainer,
+from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
                           set_seed)
+from datasets import Dataset
 from sklearn.model_selection import KFold
 from utils import evaluate_predictions, prepare_data, ENTITIES
 
@@ -151,7 +152,7 @@ class TastyModel:
         model_name_or_path = self.config["model_name_or_path"] if \
             self.config["model_name_or_path"] is not None else bert_type
 
-        self.tokenizer = BertTokenizer.from_pretrained(bert_type)
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_type)
 
         label2id = {k: int(v) for k, v in self.config["label2id"].items()}
         id2label = {v: k for k, v in label2id.items()}
@@ -191,16 +192,14 @@ class TastyModel:
 
         self.trainer.train()
 
-        self.save_model()
 
-    def evaluate(self, entities):
+    def evaluate(self, recipes, entities):
 
         pred_entities = self.predict(recipes)
 
-        evaluation_all, evaluation_by_tag = \
-            evaluate_predictions(entities, pred_entities, "bio")
+        results = evaluate_predictions(entities, pred_entities, "bio")
 
-        return evaluation_all, evaluation_by_tag
+        return results
 
     def predict(self, recipes):
 
@@ -273,7 +272,7 @@ def cross_validate(args):
         ENTITIES + ["all"]
     }
 
-    print(f"{'entity':^20s}{'precision':^14s}{'recall':^114s}{'f1-score':^14s}")
+    print(f"{'entity':^20s}{'precision':^14s}{'recall':^14s}{'f1-score':^14s}")
     for entity in cross_val_results_aggregated.keys():
         print(f"{entity:^20s}", end="")
         for metric in cross_val_results_aggregated[entity].keys():
@@ -288,7 +287,7 @@ def cross_validate(args):
             std = int(std * 1000) / 1000 + 0.001 * \
                   round(std - int(std * 1000) / 1000)
             print(f"{mean:^2.3f} +- {std:^2.3f}", end="")
-            print()
+        print()
 
     
 if __name__ == "__main__":
