@@ -1,7 +1,39 @@
+import argparse
 import re
+import json
+import numpy as np
 from transformers import (BertForTokenClassification, BertTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
                           set_seed)
+from sklearn.model_selection import KFold
+from utils import evaluate_predictions, prepare_data, ENTITIES
+
+
+LABEL2ID = {"O": 0}
+idx = 1
+for entity in ENTITIES:
+    LABEL2ID[f"B-{entity}"] = idx
+    idx += 1
+    LABEL2ID[f"I-{entity}"] = idx
+    idx += 1
+
+CONFIG = {
+    "bert_type": None,
+    "model_name_or_path": None,
+    "num_of_tokens": 128,
+    "only_first_token": True,
+
+    "training_args": {
+        "output_dir": './bert-checkpoints',
+        "learning_rate": 2e-5,
+        "per_device_train_batch_size": 16,
+        "per_device_eval_batch_size": 32,
+        "num_train_epochs": 10,
+        "weight_decay": 0.01,
+    },
+
+    "label2id" : LABEL2ID
+}
 
 
 def check_if_entity_correctly_began(entity, prev_entity):
@@ -117,7 +149,7 @@ class TastyModel:
         self.config = config
         bert_type = self.config['bert_type']
         model_name_or_path = self.config["model_name_or_path"] if \
-            self.config["model_name_or_path"] != "" else bert_type
+            self.config["model_name_or_path"] is not None else bert_type
 
         self.tokenizer = BertTokenizer.from_pretrained(bert_type)
 
@@ -207,3 +239,70 @@ class TastyModel:
         dataset = Dataset.from_dict(data)
 
         return data, dataset
+
+
+def cross_validate(args):
+
+    bio_recipes, bio_entities = prepare_data("../data/TASTEset.csv", "bio")
+
+    CONFIG["bert_type"] = args.bert_type
+    CONFIG["model_name_or_path"] = args.model_name_or_path
+    CONFIG["training_args"]["seed"] = args.seed
+
+    kf = KFold(n_splits=args.num_of_folds, shuffle=True, random_state=args.seed)
+    cross_val_results = {}
+
+    for fold_id, (train_index, test_index) in enumerate(kf.split(bio_entities)):
+        tr_recipes, vl_recipes = [bio_recipes[idx] for idx in train_index], \
+                                 [bio_recipes[idx] for idx in test_index]
+        tr_entities, vl_entities = [bio_entities[idx] for idx in train_index], \
+                                   [bio_entities[idx] for idx in test_index]
+
+        model = TastyModel(config=CONFIG)
+        model.train(tr_recipes, tr_entities)
+        results = model.evaluate(vl_recipes, vl_entities)
+
+        cross_val_results[fold_id] = results
+
+    with open("bert_cross_val_results.json", "w") as json_file:
+        json.dump(cross_val_results, json_file, indent=4)
+
+    # aggregate andprint results
+    cross_val_results_aggregated = {
+        entity: {"precision": [], "recall": [], "f1": []} for entity in
+        ENTITIES + ["all"]
+    }
+
+    print(f"{'entity':^20s}{'precision':^14s}{'recall':^114s}{'f1-score':^14s}")
+    for entity in cross_val_results_aggregated.keys():
+        print(f"{entity:^20s}", end="")
+        for metric in cross_val_results_aggregated[entity].keys():
+            for fold_id in range(args.num_of_folds):
+                cross_val_results_aggregated[entity][metric].append(
+                    cross_val_results[fold_id][entity][metric]
+                )
+
+            mean = np.mean(cross_val_results_aggregated[entity][metric])
+            mean = int(mean * 1000) / 1000
+            std = np.mean(cross_val_results_aggregated[entity][metric])
+            std = int(std * 1000) / 1000 + 0.001 * \
+                  round(std - int(std * 1000) / 1000)
+            print(f"{mean:^2.3f} +- {std:^2.3f}", end="")
+            print()
+
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('--bert-type', type=str, required=True,
+                        help='BERT type')
+    parser.add_argument('--model-name-or-path', type=str,
+                        help='path to model checkpoint')
+    parser.add_argument('--tasteset-path', type=str,
+                        default="../data/TASTEset.csv", help="path to TASTEset")
+    parser.add_argument('--num-of-folds', type=int, default=5,
+                        help="Number of folds in cross-validation")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="seed for reproducibility")
+    args = parser.parse_args()
+
+    cross_validate(args)
