@@ -182,4 +182,5 @@ def evaluate_predictions(true_entities, pred_entities, entities_format):
     for entity in results_per_tag.keys():
         results_per_tag[entity] = results_per_tag[entity]["strict"]
 
-    return results, results_per_tag
+    results_per_tag["all"] = results
+    return results_per_tag
