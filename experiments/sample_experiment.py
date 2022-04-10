@@ -26,17 +26,13 @@ def main():
 
     print("SAMPLE SPANS EVALUATION")
     print(entities[:10])
-    results, results_by_tag = \
-        evaluate_predictions(entities[:10], entities[:10], "spans")
+    results = evaluate_predictions(entities[:10], entities[:10], "spans")
     print(results)
-    print(results_by_tag)
 
     print("SAMPLE BIO EVALUATION")
     print(bio_entities[:10])
-    results, results_by_tag = \
-        evaluate_predictions(bio_entities[:10], bio_entities[:10], "bio")
+    results = evaluate_predictions(bio_entities[:10], bio_entities[:10], "bio")
     print(results)
-    print(results_by_tag)
 
 
 if __name__ == "__main__":
