@@ -4,10 +4,11 @@ import json
 import numpy as np
 from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
-                          set_seed)
+                          set_seed, BertConfig)
 from datasets import Dataset
 from sklearn.model_selection import KFold
 from utils import evaluate_predictions, prepare_data, ENTITIES
+from torchcrf import CRF
 
 
 LABEL2ID = {"O": 0}
@@ -33,7 +34,7 @@ CONFIG = {
         "weight_decay": 0.01,
     },
 
-    "label2id" : LABEL2ID
+    "label2id": LABEL2ID
 }
 
 
@@ -117,31 +118,99 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
     tokenized_data = tokenizer(recipes, truncation=True, max_length=max_length,
                                is_split_into_words=True)
 
-    if entities:
-        labels = []
-        for i, entity in enumerate(entities):
-            # Map tokens to their respective word.
-            word_ids = tokenized_data.word_ids(batch_index=i)
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:
+    labels = []
+    recipes_words_begginings = []  # mark all first subwords,
+    # e.g. 'white sugar' which is split into ["wh", "##ite", "sug". "##ar"]
+    # would have [1, 0, 1, 0]. This is used as prediction mask in the BertCRF
+
+    for recipe_idx in range(len(recipes)):
+        # Map tokens to their respective word.
+        word_ids = tokenized_data.word_ids(batch_index=recipe_idx)
+        previous_word_idx = None
+        label_ids = []
+        words_begginings = []
+        for word_idx in word_ids:
+            if word_idx is None:
+                words_begginings.append(0)
+            elif word_idx != previous_word_idx:
+                words_begginings.append(1)
+            else:
+                words_begginings.append(0)
+            if entities:
                 if word_idx is None:
                     new_label = -100
                 # Only label the first token of a given word.
                 elif word_idx != previous_word_idx:
-                    new_label = label2id[entity[word_idx]]
+                    new_label = label2id[entities[recipe_idx][word_idx]]
                 else:
                     new_label = -100 if only_first_token \
-                        else label2id[entity[word_idx]]
+                        else label2id[entities[recipe_idx][word_idx]]
                 label_ids.append(new_label)
-                previous_word_idx = word_idx
+            previous_word_idx = word_idx
 
+        recipes_words_begginings.append(words_begginings)
+        if entities:
             labels.append(label_ids)
 
+    if entities:
         tokenized_data["labels"] = labels
+
     tokenized_data["recipes"] = recipes
+    tokenized_data["prediction_mask"] = recipes_words_begginings
 
     return tokenized_data
+
+
+class BERTCRF(BertForTokenClassification):
+    """
+    BERT with CRF layer on top. This class directly follows implementation used
+    in "BERTimbau: Pretrained BERT Models for Brazilian Portuguese", which was
+    made available under the MIT license and can be found under the following
+    link:  https://github.com/neuralmind-ai/portuguese-bert
+    """
+    def __init__(self, config):
+        """
+        :param config: BertConfig
+        """
+        super().__init__(config)
+        self.crf = CRF(num_tags=config.num_labels, batch_first=True)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
+                labels=None, prediction_mask=None,):
+
+        output = self.bert(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask
+        )[0]
+
+        output = self.dropout(output)
+        logits = self.classifier(output)
+
+        outputs = {'logits': logits}
+
+        mask = prediction_mask
+        batch_size = logits.shape[0]
+
+        if labels is not None:
+            loss = 0
+            for seq_logits, seq_labels, seq_mask in zip(logits, labels, mask):
+                seq_logits = seq_logits[seq_mask].unsqueeze(0)
+                seq_labels = seq_labels[seq_mask].unsqueeze(0)
+                loss -= self.crf(seq_logits, seq_labels, reduction='token_mean')
+            loss /= batch_size
+            outputs['loss'] = loss
+
+        else:
+            output_tags = []
+            for seq_logits, seq_mask in zip(logits, mask):
+                seq_logits = seq_logits[seq_mask].unsqueeze(0)
+                tags = self.crf.decode(seq_logits)
+                output_tags.append(tags[0])
+
+            outputs['y_pred'] = output_tags
+
+        return outputs
 
 
 class TastyModel:
@@ -160,13 +229,19 @@ class TastyModel:
         # for reproducibility
         set_seed(self.config["training_args"]["seed"])
 
-        model = BertForTokenClassification.from_pretrained(
+        bert_config = BertConfig(
             model_name_or_path,
             num_labels=len(self.config["label2id"]),
             ignore_mismatched_sizes=True,
-            label2id=label2id, id2label=id2label,
+            label2id=label2id,
+            id2label=id2label,
             classifier_dropout=0.2
         )
+
+        if self.config["use_crf"] is True:
+            model = BERTCRF(bert_config)
+        else:
+            model = BertForTokenClassification(bert_config)
 
         training_args = TrainingArguments(
             **self.config["training_args"]
@@ -193,7 +268,6 @@ class TastyModel:
 
         self.trainer.train()
 
-
     def evaluate(self, recipes, entities):
 
         pred_entities = self.predict(recipes)
@@ -207,8 +281,11 @@ class TastyModel:
         data, dataset = self.prepare_data(recipes, [])
         preds = self.trainer.predict(dataset)
 
-        token_probs = preds[0]
-        token_labels = token_probs.argmax(axis=2)
+        if self.config["use_crf"] is True:
+            token_probs = preds[0]
+            token_labels = token_probs.argmax(axis=2)
+        else:
+            token_labels = preds["y_pred"]
 
         pred_entities = []
 
@@ -219,12 +296,20 @@ class TastyModel:
             text_split_tokens = self.tokenizer.convert_ids_to_tokens(
                 data["input_ids"][recipe_idx])
 
-            pred_entities.append(token_to_entity_predictions(
-                text_split_words,
-                text_split_tokens,
-                token_labels[recipe_idx],
-                self.trainer.model.config.id2label
-            ))
+            id2label = self.trainer.model.config.id2label
+            if self.config["use_crf"] is True:  # labels are associated to
+                # first subwords, hence, are already the word entities
+                word_entities = \
+                    [self.trainer.model.config.id2label[word_label] for
+                     word_label in token_labels]
+            else:
+                word_entities = token_to_entity_predictions(
+                    text_split_words,
+                    text_split_tokens,
+                    token_labels[recipe_idx],
+                    id2label
+                )
+            pred_entities.append(word_entities)
 
         return pred_entities
 
