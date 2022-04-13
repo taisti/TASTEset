@@ -1,10 +1,14 @@
 import argparse
 import re
 import json
+import torch
+from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
                           set_seed, BertConfig)
+from transformers.utils import ModelOutput
+from typing import Optional
 from datasets import Dataset
 from sklearn.model_selection import KFold
 from utils import evaluate_predictions, prepare_data, ENTITIES
@@ -119,7 +123,7 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
                                is_split_into_words=True)
 
     labels = []
-    recipes_words_begginings = []  # mark all first subwords,
+    recipes_words_beginnings = []  # mark all first subwords,
     # e.g. 'white sugar' which is split into ["wh", "##ite", "sug". "##ar"]
     # would have [1, 0, 1, 0]. This is used as prediction mask in the BertCRF
 
@@ -128,14 +132,14 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
         word_ids = tokenized_data.word_ids(batch_index=recipe_idx)
         previous_word_idx = None
         label_ids = []
-        words_begginings = []
+        words_beginnings = []
         for word_idx in word_ids:
             if word_idx is None:
-                words_begginings.append(0)
+                words_beginnings.append(False)
             elif word_idx != previous_word_idx:
-                words_begginings.append(1)
+                words_beginnings.append(True)
             else:
-                words_begginings.append(0)
+                words_beginnings.append(False)
             if entities:
                 if word_idx is None:
                     new_label = -100
@@ -147,8 +151,9 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
                         else label2id[entities[recipe_idx][word_idx]]
                 label_ids.append(new_label)
             previous_word_idx = word_idx
-
-        recipes_words_begginings.append(words_begginings)
+        
+        words_beginnings += (max_length - len(words_beginnings)) * [False]
+        recipes_words_beginnings.append(words_beginnings)
         if entities:
             labels.append(label_ids)
 
@@ -156,10 +161,16 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
         tokenized_data["labels"] = labels
 
     tokenized_data["recipes"] = recipes
-    tokenized_data["prediction_mask"] = recipes_words_begginings
+    tokenized_data["prediction_mask"] = recipes_words_beginnings
 
     return tokenized_data
 
+
+class BertCRFOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    y_preds: Optional[torch.FloatTensor] = None
+    predictions: Optional[torch.FloatTensor] = None
 
 class BERTCRF(BertForTokenClassification):
     """
@@ -177,24 +188,26 @@ class BERTCRF(BertForTokenClassification):
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
                 labels=None, prediction_mask=None,):
+        
+        outputs = {}
 
         output = self.bert(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             attention_mask=attention_mask
         )[0]
-
+        
         output = self.dropout(output)
         logits = self.classifier(output)
 
-        outputs = {'logits': logits}
-
         mask = prediction_mask
         batch_size = logits.shape[0]
-
+        
+        outputs['logits'] = logits
         if labels is not None:
             loss = 0
             for seq_logits, seq_labels, seq_mask in zip(logits, labels, mask):
+                seq_mask = [i for i, mask in enumerate(seq_mask) if mask]
                 seq_logits = seq_logits[seq_mask].unsqueeze(0)
                 seq_labels = seq_labels[seq_mask].unsqueeze(0)
                 loss -= self.crf(seq_logits, seq_labels, reduction='token_mean')
@@ -204,13 +217,19 @@ class BERTCRF(BertForTokenClassification):
         else:
             output_tags = []
             for seq_logits, seq_mask in zip(logits, mask):
+                seq_mask = [i for i, mask in enumerate(seq_mask) if mask]
                 seq_logits = seq_logits[seq_mask].unsqueeze(0)
                 tags = self.crf.decode(seq_logits)
                 output_tags.append(tags[0])
-
-            outputs['y_pred'] = output_tags
-
-        return outputs
+            
+            #print(output_tags)
+            output_tags = [tags + [-100] * (128 - len(tags)) for tags in output_tags]
+            #output_tags = [torch.tensor(el) for el in output_tags]
+            #outputs_tags = pad_sequence(output_tags, batch_first=True, padding_value=-100)
+            #print(outputs_tags.shape)
+            outputs['predictions'] = torch.tensor(output_tags)
+                
+        return BertCRFOutput(**outputs)
 
 
 class TastyModel:
@@ -229,19 +248,26 @@ class TastyModel:
         # for reproducibility
         set_seed(self.config["training_args"]["seed"])
 
-        bert_config = BertConfig(
-            model_name_or_path,
-            num_labels=len(self.config["label2id"]),
-            ignore_mismatched_sizes=True,
-            label2id=label2id,
-            id2label=id2label,
-            classifier_dropout=0.2
-        )
-
         if self.config["use_crf"] is True:
-            model = BERTCRF(bert_config)
+            model = BERTCRF.from_pretrained(
+                        model_name_or_path,
+                        num_labels=len(self.config["label2id"]),
+                        #ignore_mismatched_sizes=True,
+                        label2id=label2id,
+                        id2label=id2label,
+                        classifier_dropout=0.2
+                    )
         else:
-            model = BertForTokenClassification(bert_config)
+            #model = BertForTokenClassification.from_pretrained(model_name_or_path)
+            model = BertForTokenClassification.from_pretrained(
+                model_name_or_path,
+                num_labels=len(self.config["label2id"]),
+                #ignore_mismatched_sizes=True,
+                label2id=label2id,
+                id2label=id2label,
+                classifier_dropout=0.2
+            )
+       
 
         training_args = TrainingArguments(
             **self.config["training_args"]
@@ -280,12 +306,18 @@ class TastyModel:
 
         data, dataset = self.prepare_data(recipes, [])
         preds = self.trainer.predict(dataset)
-
+        #print(len(preds.predictions))
+        #print(len(preds[0][0]))
+        #print(len(preds[0][1]))
+        #print(preds[0][1])
+        #print(preds[0][1])
         if self.config["use_crf"] is True:
+            token_labels = preds[0][1]
+            #print(token_labels)
+            #print([len(xd) for xd in token_labels])
+        else:
             token_probs = preds[0]
             token_labels = token_probs.argmax(axis=2)
-        else:
-            token_labels = preds["y_pred"]
 
         pred_entities = []
 
@@ -301,7 +333,7 @@ class TastyModel:
                 # first subwords, hence, are already the word entities
                 word_entities = \
                     [self.trainer.model.config.id2label[word_label] for
-                     word_label in token_labels]
+                     word_label in token_labels[recipe_idx] if word_label != -100]
             else:
                 word_entities = token_to_entity_predictions(
                     text_split_words,
@@ -332,6 +364,7 @@ def cross_validate(args):
 
     CONFIG["bert_type"] = args.bert_type
     CONFIG["model_name_or_path"] = args.model_name_or_path
+    CONFIG["use_crf"] = args.use_crf
     CONFIG["training_args"]["seed"] = args.seed
 
     kf = KFold(n_splits=args.num_of_folds, shuffle=True, random_state=args.seed)
@@ -346,7 +379,7 @@ def cross_validate(args):
         model = TastyModel(config=CONFIG)
         model.train(tr_recipes, tr_entities)
         results = model.evaluate(vl_recipes, vl_entities)
-
+        print(results)
         cross_val_results[fold_id] = results
 
     with open("bert_cross_val_results.json", "w") as json_file:
@@ -388,6 +421,8 @@ if __name__ == "__main__":
                         help="Number of folds in cross-validation")
     parser.add_argument("--seed", type=int, default=42,
                         help="seed for reproducibility")
+    parser.add_argument("--use-crf", action='store_true',
+                        help="Use CRF layer on top of BERT + linear layer")
     args = parser.parse_args()
 
     cross_validate(args)
