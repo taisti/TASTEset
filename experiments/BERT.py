@@ -1,13 +1,17 @@
 import argparse
 import re
 import json
+import torch
 import numpy as np
 from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
                           set_seed)
+from transformers.utils import ModelOutput
+from typing import Optional
 from datasets import Dataset
 from sklearn.model_selection import KFold
 from utils import evaluate_predictions, prepare_data, ENTITIES
+from torchcrf import CRF
 
 
 LABEL2ID = {"O": 0}
@@ -29,11 +33,11 @@ CONFIG = {
         "learning_rate": 2e-5,
         "per_device_train_batch_size": 16,
         "per_device_eval_batch_size": 32,
-        "num_train_epochs": 10,
+        "num_train_epochs": 30,
         "weight_decay": 0.01,
     },
 
-    "label2id" : LABEL2ID
+    "label2id": LABEL2ID
 }
 
 
@@ -117,31 +121,111 @@ def tokenize_and_align_labels(recipes, entities, tokenizer, max_length,
     tokenized_data = tokenizer(recipes, truncation=True, max_length=max_length,
                                is_split_into_words=True)
 
-    if entities:
-        labels = []
-        for i, entity in enumerate(entities):
-            # Map tokens to their respective word.
-            word_ids = tokenized_data.word_ids(batch_index=i)
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:
+    labels = []
+    recipes_words_beginnings = []  # mark all first subwords,
+    # e.g. 'white sugar' which is split into ["wh", "##ite", "sug". "##ar"]
+    # would have [1, 0, 1, 0]. This is used as prediction mask in the BertCRF
+
+    for recipe_idx in range(len(recipes)):
+        # Map tokens to their respective word.
+        word_ids = tokenized_data.word_ids(batch_index=recipe_idx)
+        previous_word_idx = None
+        label_ids = []
+        words_beginnings = []
+        for word_idx in word_ids:
+            if word_idx is None:
+                words_beginnings.append(False)
+            elif word_idx != previous_word_idx:
+                words_beginnings.append(True)
+            else:
+                words_beginnings.append(False)
+            if entities:
                 if word_idx is None:
                     new_label = -100
                 # Only label the first token of a given word.
                 elif word_idx != previous_word_idx:
-                    new_label = label2id[entity[word_idx]]
+                    new_label = label2id[entities[recipe_idx][word_idx]]
                 else:
                     new_label = -100 if only_first_token \
-                        else label2id[entity[word_idx]]
+                        else label2id[entities[recipe_idx][word_idx]]
                 label_ids.append(new_label)
-                previous_word_idx = word_idx
-
+            previous_word_idx = word_idx
+        
+        words_beginnings += (max_length - len(words_beginnings)) * [False]
+        recipes_words_beginnings.append(words_beginnings)
+        if entities:
             labels.append(label_ids)
 
+    if entities:
         tokenized_data["labels"] = labels
+
     tokenized_data["recipes"] = recipes
+    tokenized_data["prediction_mask"] = recipes_words_beginnings
 
     return tokenized_data
+
+
+class BertCRFOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    y_preds: Optional[torch.FloatTensor] = None
+    predictions: Optional[torch.FloatTensor] = None
+
+
+class BERTCRF(BertForTokenClassification):
+    """
+    BERT with CRF layer on top. This class directly follows implementation used
+    in "BERTimbau: Pretrained BERT Models for Brazilian Portuguese", which was
+    made available under the MIT license and can be found under the following
+    link:  https://github.com/neuralmind-ai/portuguese-bert
+    """
+    def __init__(self, config):
+        """
+        :param config: BertConfig
+        """
+        super().__init__(config)
+        self.crf = CRF(num_tags=config.num_labels, batch_first=True)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
+                labels=None, prediction_mask=None,):
+        
+        outputs = {}
+
+        output = self.bert(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask
+        )[0]
+        
+        output = self.dropout(output)
+        logits = self.classifier(output)
+
+        mask = prediction_mask
+        batch_size = logits.shape[0]
+        
+        outputs['logits'] = logits
+        if labels is not None:
+            loss = 0
+            for seq_logits, seq_labels, seq_mask in zip(logits, labels, mask):
+                seq_mask = [i for i, mask in enumerate(seq_mask) if mask]
+                seq_logits = seq_logits[seq_mask].unsqueeze(0)
+                seq_labels = seq_labels[seq_mask].unsqueeze(0)
+                loss -= self.crf(seq_logits, seq_labels, reduction='token_mean')
+            loss /= batch_size
+            outputs['loss'] = loss
+
+        else:
+            output_tags = []
+            for seq_logits, seq_mask in zip(logits, mask):
+                seq_mask = [i for i, mask in enumerate(seq_mask) if mask]
+                seq_logits = seq_logits[seq_mask].unsqueeze(0)
+                tags = self.crf.decode(seq_logits)
+                output_tags.append(tags[0])
+
+            output_tags = [tags + [-100] * (128 - len(tags)) for tags in output_tags]
+            outputs['predictions'] = torch.tensor(output_tags)
+                
+        return BertCRFOutput(**outputs)
 
 
 class TastyModel:
@@ -160,13 +244,28 @@ class TastyModel:
         # for reproducibility
         set_seed(self.config["training_args"]["seed"])
 
-        model = BertForTokenClassification.from_pretrained(
-            model_name_or_path,
-            num_labels=len(self.config["label2id"]),
-            ignore_mismatched_sizes=True,
-            label2id=label2id, id2label=id2label,
-            classifier_dropout=0.2
-        )
+        # to discard pretrained classification layer
+        ignore_mismatched_sizes = True if \
+            self.config["model_name_or_path"] is not None else False
+
+        if self.config["use_crf"] is True:
+            model = BERTCRF.from_pretrained(
+                        model_name_or_path,
+                        num_labels=len(self.config["label2id"]),
+                        ignore_mismatched_sizes=ignore_mismatched_sizes,
+                        label2id=label2id,
+                        id2label=id2label,
+                        classifier_dropout=0.2
+                    )
+        else:
+            model = BertForTokenClassification.from_pretrained(
+                model_name_or_path,
+                num_labels=len(self.config["label2id"]),
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
+                label2id=label2id,
+                id2label=id2label,
+                classifier_dropout=0.2
+            )
 
         training_args = TrainingArguments(
             **self.config["training_args"]
@@ -193,7 +292,6 @@ class TastyModel:
 
         self.trainer.train()
 
-
     def evaluate(self, recipes, entities):
 
         pred_entities = self.predict(recipes)
@@ -207,8 +305,11 @@ class TastyModel:
         data, dataset = self.prepare_data(recipes, [])
         preds = self.trainer.predict(dataset)
 
-        token_probs = preds[0]
-        token_labels = token_probs.argmax(axis=2)
+        if self.config["use_crf"] is True:
+            token_labels = preds[0][1]
+        else:
+            token_probs = preds[0]
+            token_labels = token_probs.argmax(axis=2)
 
         pred_entities = []
 
@@ -219,12 +320,20 @@ class TastyModel:
             text_split_tokens = self.tokenizer.convert_ids_to_tokens(
                 data["input_ids"][recipe_idx])
 
-            pred_entities.append(token_to_entity_predictions(
-                text_split_words,
-                text_split_tokens,
-                token_labels[recipe_idx],
-                self.trainer.model.config.id2label
-            ))
+            id2label = self.trainer.model.config.id2label
+            if self.config["use_crf"] is True:  # labels are associated to
+                # first subwords, hence, are already the word entities
+                word_entities = \
+                    [self.trainer.model.config.id2label[word_label] for
+                     word_label in token_labels[recipe_idx] if word_label != -100]
+            else:
+                word_entities = token_to_entity_predictions(
+                    text_split_words,
+                    text_split_tokens,
+                    token_labels[recipe_idx],
+                    id2label
+                )
+            pred_entities.append(word_entities)
 
         return pred_entities
 
@@ -247,6 +356,7 @@ def cross_validate(args):
 
     CONFIG["bert_type"] = args.bert_type
     CONFIG["model_name_or_path"] = args.model_name_or_path
+    CONFIG["use_crf"] = args.use_crf
     CONFIG["training_args"]["seed"] = args.seed
 
     kf = KFold(n_splits=args.num_of_folds, shuffle=True, random_state=args.seed)
@@ -261,7 +371,7 @@ def cross_validate(args):
         model = TastyModel(config=CONFIG)
         model.train(tr_recipes, tr_entities)
         results = model.evaluate(vl_recipes, vl_entities)
-
+        print(results)
         cross_val_results[fold_id] = results
 
     with open("bert_cross_val_results.json", "w") as json_file:
@@ -303,6 +413,8 @@ if __name__ == "__main__":
                         help="Number of folds in cross-validation")
     parser.add_argument("--seed", type=int, default=42,
                         help="seed for reproducibility")
+    parser.add_argument("--use-crf", action='store_true',
+                        help="Use CRF layer on top of BERT + linear layer")
     args = parser.parse_args()
 
     cross_validate(args)
