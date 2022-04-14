@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
-                          set_seed, BertConfig)
+                          set_seed)
 from transformers.utils import ModelOutput
 from typing import Optional
 from datasets import Dataset
@@ -33,7 +33,7 @@ CONFIG = {
         "learning_rate": 2e-5,
         "per_device_train_batch_size": 16,
         "per_device_eval_batch_size": 32,
-        "num_train_epochs": 10,
+        "num_train_epochs": 30,
         "weight_decay": 0.01,
     },
 
