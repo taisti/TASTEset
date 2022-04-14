@@ -2,7 +2,6 @@ import argparse
 import re
 import json
 import torch
-from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from transformers import (BertForTokenClassification, AutoTokenizer, Trainer,
                           TrainingArguments, DataCollatorForTokenClassification,
@@ -172,6 +171,7 @@ class BertCRFOutput(ModelOutput):
     y_preds: Optional[torch.FloatTensor] = None
     predictions: Optional[torch.FloatTensor] = None
 
+
 class BERTCRF(BertForTokenClassification):
     """
     BERT with CRF layer on top. This class directly follows implementation used
@@ -221,12 +221,8 @@ class BERTCRF(BertForTokenClassification):
                 seq_logits = seq_logits[seq_mask].unsqueeze(0)
                 tags = self.crf.decode(seq_logits)
                 output_tags.append(tags[0])
-            
-            #print(output_tags)
+
             output_tags = [tags + [-100] * (128 - len(tags)) for tags in output_tags]
-            #output_tags = [torch.tensor(el) for el in output_tags]
-            #outputs_tags = pad_sequence(output_tags, batch_first=True, padding_value=-100)
-            #print(outputs_tags.shape)
             outputs['predictions'] = torch.tensor(output_tags)
                 
         return BertCRFOutput(**outputs)
@@ -248,26 +244,28 @@ class TastyModel:
         # for reproducibility
         set_seed(self.config["training_args"]["seed"])
 
+        # to discard pretrained classification layer
+        ignore_mismatched_sizes = True if \
+            self.config["model_name_or_path"] is not None else False
+
         if self.config["use_crf"] is True:
             model = BERTCRF.from_pretrained(
                         model_name_or_path,
                         num_labels=len(self.config["label2id"]),
-                        #ignore_mismatched_sizes=True,
+                        ignore_mismatched_sizes=ignore_mismatched_sizes,
                         label2id=label2id,
                         id2label=id2label,
                         classifier_dropout=0.2
                     )
         else:
-            #model = BertForTokenClassification.from_pretrained(model_name_or_path)
             model = BertForTokenClassification.from_pretrained(
                 model_name_or_path,
                 num_labels=len(self.config["label2id"]),
-                #ignore_mismatched_sizes=True,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
                 label2id=label2id,
                 id2label=id2label,
                 classifier_dropout=0.2
             )
-       
 
         training_args = TrainingArguments(
             **self.config["training_args"]
@@ -306,15 +304,9 @@ class TastyModel:
 
         data, dataset = self.prepare_data(recipes, [])
         preds = self.trainer.predict(dataset)
-        #print(len(preds.predictions))
-        #print(len(preds[0][0]))
-        #print(len(preds[0][1]))
-        #print(preds[0][1])
-        #print(preds[0][1])
+
         if self.config["use_crf"] is True:
             token_labels = preds[0][1]
-            #print(token_labels)
-            #print([len(xd) for xd in token_labels])
         else:
             token_probs = preds[0]
             token_labels = token_probs.argmax(axis=2)
