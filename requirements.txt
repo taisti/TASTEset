@@ -13,7 +13,6 @@ cymem~=2.0.6
 dataclasses~=0.8
 datasets~=2.0.0
 dill~=0.3.4
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.2.0/en_core_web_sm-3.2.0-py3-none-any.whl
 filelock~=3.4.1
 frozenlist~=1.2.0
 fsspec~=2022.1.0
@@ -41,6 +40,7 @@ pyarrow~=6.0.1
 pydantic~=1.8.2
 pyparsing~=3.0.7
 python-dateutil~=2.8.2
+pytorch-crf~=0.7.2
 pytz~=2022.1
 PyYAML~=6.0
 regex~=2022.3.15
